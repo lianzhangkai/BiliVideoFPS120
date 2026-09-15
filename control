@@ -1,0 +1,9 @@
+Package: com.chatgpt.bilivideofps120
+Name: BiliVideoFPS120
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Bilibili IJK actual video FPS monitor plus safe 120fps source cap lift for iOS 13 ProMotion devices.
+Maintainer: ChatGPT + user test build
+Author: ChatGPT + user test build
+Section: Tweaks
+Depends: firmware (>= 13.0), mobilesubstrate | org.coolstar.libhooker
