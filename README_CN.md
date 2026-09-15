@@ -1,66 +1,52 @@
-# BiliVideoFPS120 0.1.6 — Layer Type Compile Fix
+# BiliVideoFPS120 0.1.7 SafeViewFPSProbe
 
-针对 0.1.3 日志已经确认的情况：
+这是 0.1.6 闪退后的安全诊断版。
 
-- `IJKFFMoviePlayerController` 确实是当前播放器；
-- `setPlaybackRate:` 能抓到 1×/3×；
-- B站把 IJK `max-fps` 设为 60，插件已改为 120；
-- 但标准 `IJKSDLGLView -display:` 与 `EAGLContext -presentRenderbuffer:` 都没有帧。
+## 关键变化
 
-这强烈说明当前 B站版本使用了 IJK 的 **第三方 GL View** 通道。公开的 IJK 接口 `IJKSDLGLViewProtocol` 对第三方渲染器定义的是 `-display_pixels:`，而 `IJKFFMoviePlayerController` 也提供 `initWithMoreContent...withGLView:` 来注入第三方 View。
+0.1.7 删除所有高风险渲染后端 Hook：
 
-## 0.1.5 功能保留
+- 不 Hook `EAGLContext -presentRenderbuffer:`
+- 不 Hook `CAMetalLayer -nextDrawable`
+- 不 Hook `AVSampleBufferDisplayLayer -enqueueSampleBuffer:`
+- 不 Hook `IJKSDLGLView -display:`
+- 不动态 Hook 第三方 View 的 `display_pixels:`
 
-1. 在 `prepareToPlay/play/setPlaybackRate:` 时直接读取当前 IJK player 的 `view`。
-2. 记录实际渲染 View 的类名、Layer 类型、`isThirdGLView`。
-3. **动态 Hook 实际 View 类的 `display_pixels:`**，统计 IJK 向第三方渲染器提交的真实视频帧数。
-4. 如果该 View 自己实现 `fps`，也作为备用输出 FPS（显示后缀 `VFP`）。
-5. `SRC` 除 `fpsInMeta` 外，再使用 `IJKFFMonitor.fps` 回退，解决部分 fork 中 SRC 一直 `--`。
-6. 保留 `max-fps 60 -> 120`、SampleBuffer / EAGL / Metal 多后端探测、B站 UI 60→120 CADisplayLink 提升。
+只保留此前已验证不会导致闪退的：
 
-## 显示
+- `IJKFFMoviePlayerController -prepareToPlay`
+- `-play`
+- `-setPlaybackRate:`
+- `IJKFFOptions max-fps 60 -> 120`
+- B站内 `CADisplayLink 60 -> 120`
 
-优先命中第三方渲染通道时：
+## FPS 检测方式
 
-```
-VID 59.8 PIX | SRC 60 | 1.0x
-VID 118.6 PIX | SRC 60 | 2.0x
-```
+每 0.5 秒直接读取：
 
-`PIX` = IJK `display_pixels:` 的提交频率。
+1. `IJKFFMoviePlayerController.view`
+2. `view.fps`
+3. `IJKFFMoviePlayerController.fpsAtOutput`
+4. `fpsInMeta` / `monitor.fps`
 
-如果只拿到渲染 View 自带的 fps：
+显示示例：
 
-```
-VID 59.8 VFP | SRC 60 | 1.0x
-```
+`VID 59.9 VIEW | SRC 60 | 1.0x`
 
-仍未命中时会显示：
+如果 VIEW 没有值但 controller 有：
 
-```
-VID -- | H P1 T1 E1 I1 S1 M1 | 1.0x
-```
+`VID 59.9 OUT | SRC 60 | 1.0x`
 
-其中 `T1` 表示实际播放器 View 的 `display_pixels:` Hook 已安装。
+## 日志
 
-日志：B站沙盒 `Documents/BiliVideoFPS120.log`。
+B站数据容器的：
+
+`Documents/BiliVideoFPS120.log`
+
+会记录实际 `player.view` 的类名、layer 类名、是否实现 `fps` / `display_pixels:` / `display:`。
 
 ## 编译
 
 ```bash
 make clean package FINALPACKAGE=1 messages=yes
 ```
-
-
-## 0.1.6 编译修复
-
-修复 iOS 13.7 SDK + Objective-C++ 下 `id view` 直接调用 `[view layer]` 时的歧义：SDK 同时暴露了 `UIView.layer`、`CAMetalLayer.layer`、`AVMovieTrack.layer` 等声明，在 `-Werror` 下会直接编译失败。
-
-现在先显式判断并转换为 `UIView *`，再读取 `CALayer *`：
-
-```objc
-UIView *renderView = [view isKindOfClass:[UIView class]] ? (UIView *)view : nil;
-CALayer *renderLayer = renderView ? renderView.layer : nil;
-```
-
-运行逻辑与 0.1.5 不变。
