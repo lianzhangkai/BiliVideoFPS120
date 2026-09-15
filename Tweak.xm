@@ -10,7 +10,7 @@
 #include <string.h>
 
 /*
- * BiliVideoFPS120 0.1.5
+ * BiliVideoFPS120 0.1.6
  *
  * Why 0.1.0 could show VID -- / SRC -- forever:
  * Bilibili can load its ijkplayer classes after tweak construction. A Logos
@@ -146,8 +146,16 @@ static void GTProbePlayerRenderView(id player) {
     BOOL third = NO;
     SEL thirdSel = NSSelectorFromString(@"isThirdGLView");
     if ([view respondsToSelector:thirdSel]) third = ((BOOL(*)(id,SEL))objc_msgSend)(view, thirdSel);
+    // `view` is intentionally typed as id because Bilibili may supply a custom
+    // IJK renderer.  Cast to UIView before asking for -layer; otherwise old
+    // iOS 13 SDK headers expose several unrelated `layer` methods/properties
+    // (UIView, CAMetalLayer, AVMovieTrack) and clang treats `[view layer]` as
+    // ambiguous under -Werror.
+    UIView *renderView = [view isKindOfClass:[UIView class]] ? (UIView *)view : nil;
+    CALayer *renderLayer = renderView ? renderView.layer : nil;
+    NSString *layerClassName = renderLayer ? NSStringFromClass([renderLayer class]) : @"(none)";
     GTLog(@"RENDERVIEW class=%@ obj=%p layer=%@ third=%d display_pixels=%d display=%d fps=%d",
-          NSStringFromClass(vc), view, NSStringFromClass([[view layer] class]), third, hasPixels, hasDisplay, hasFPS);
+          NSStringFromClass(vc), view, layerClassName, third, hasPixels, hasDisplay, hasFPS);
 
     if (hasPixels && (!gThirdPixelsHooked || gActiveRenderViewClass != vc)) {
         // IJK's third-party render protocol sends decoded overlays through

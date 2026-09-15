@@ -1,4 +1,4 @@
-# BiliVideoFPS120 0.1.5 — ThirdGLView Probe
+# BiliVideoFPS120 0.1.6 — Layer Type Compile Fix
 
 针对 0.1.3 日志已经确认的情况：
 
@@ -9,7 +9,7 @@
 
 这强烈说明当前 B站版本使用了 IJK 的 **第三方 GL View** 通道。公开的 IJK 接口 `IJKSDLGLViewProtocol` 对第三方渲染器定义的是 `-display_pixels:`，而 `IJKFFMoviePlayerController` 也提供 `initWithMoreContent...withGLView:` 来注入第三方 View。
 
-## 0.1.5 新增
+## 0.1.5 功能保留
 
 1. 在 `prepareToPlay/play/setPlaybackRate:` 时直接读取当前 IJK player 的 `view`。
 2. 记录实际渲染 View 的类名、Layer 类型、`isThirdGLView`。
@@ -50,3 +50,17 @@ VID -- | H P1 T1 E1 I1 S1 M1 | 1.0x
 ```bash
 make clean package FINALPACKAGE=1 messages=yes
 ```
+
+
+## 0.1.6 编译修复
+
+修复 iOS 13.7 SDK + Objective-C++ 下 `id view` 直接调用 `[view layer]` 时的歧义：SDK 同时暴露了 `UIView.layer`、`CAMetalLayer.layer`、`AVMovieTrack.layer` 等声明，在 `-Werror` 下会直接编译失败。
+
+现在先显式判断并转换为 `UIView *`，再读取 `CALayer *`：
+
+```objc
+UIView *renderView = [view isKindOfClass:[UIView class]] ? (UIView *)view : nil;
+CALayer *renderLayer = renderView ? renderView.layer : nil;
+```
+
+运行逻辑与 0.1.5 不变。
