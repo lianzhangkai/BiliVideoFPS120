@@ -1,34 +1,31 @@
-# BiliVideoFPS120 0.1.2 — LateLoad + 真视频帧提交计数
+# BiliVideoFPS120 0.1.3 — EAGL Present Probe
 
-这是 0.1.1 的编译修正版。0.1.0 如果一直显示 `VID -- | SRC --`，最可能的原因是 B站把 ijkplayer 动态加载得较晚，Tweak 构造时 `IJKFFMoviePlayerController` 还不存在，固定 Logos hook 没挂上。
+本版用于解决 0.1.2 中 `VID --` 且 `/var/mobile/Media/BiliVideoFPS120.log` 不存在的问题。
 
-0.1.2 保留 0.1.1 的功能，并修复 Theos/Logos 预处理错误：`%orig(120)` / `%orig(1)` 改为先写入局部变量，再调用 `%orig(variable)`。
+## 关键变化
 
-核心功能：
+- 不再依赖 `IJKSDLGLView -display:` 才能统计视频帧。
+- 新增对系统 `EAGLContext -presentRenderbuffer:` 的进程内 Hook。老版 ijkplayer 每真正提交一帧 OpenGL 视频时都会调用这里，因此它可以绕过 B站私有/改名 IJK 类。
+- `IJKSDLGLView -display:` 仍保留为辅助计数器。
+- 日志改写入 Bilibili 自己的沙盒 Documents，避免 App Sandbox 拒绝写 `/var/mobile/Media/`。
+- 未检测到帧时，浮层显示 `VID -- | E1 I0 | 1.0x`：`E1` 表示 EAGL present hook 已安装；`I1` 表示 IJKSDLGLView display hook 已安装。
+- 运行时 IJK Hook 重试窗口从约 20 秒延长到约 60 秒。
 
-- 不再假设 IJK 类在启动时已经存在；每 0.5 秒重试，最多约 20 秒。
-- 直接 hook `IJKSDLGLView -display:`，只统计非 NULL overlay 的真实视频帧提交次数。因此即使 controller 的 `fpsAtOutput` 不可用，`VID` 也应该能显示。
-- `SRC` 仍优先读取 `IJKFFMoviePlayerController -fpsInMeta`；如果这个 B站版本没有该接口，SRC 可能仍显示 `--`，但不影响最关键的 VID 实测。
-- 保留 `max-fps=120` 的安全放宽。
-- 保留 B站进程内 `CADisplayLink 60 -> 120` / `frameInterval 2 -> 1`。
-- 日志会记录 IJK/KSY 候选类和 hook 状态，便于继续定位私有 fork。
+## 日志位置
 
-## 测试重点
+Filza → 应用管理器 → Bilibili → 数据容器 → Documents → `BiliVideoFPS120.log`
 
-找一个明确 60fps 视频，分别看：
+物理路径会是：
 
-- 1x：VID 是否约 60
-- 2x：VID 是约 60 还是约 120
-- 3x：VID 上限预期不超过约 120
+`/var/mobile/Containers/Data/Application/<Bilibili UUID>/Documents/BiliVideoFPS120.log`
 
-如果 `VID` 有数值而 `SRC` 还是 `--`，已经足够判断倍速时是否真的把源帧送满 120Hz。若 VID 仍为 `--`，把 `/var/mobile/Media/BiliVideoFPS120.log` 发回来，里面会列出实际加载的 IJK/KSY 类名。
+UUID 每次重装 App 都可能改变。
 
-## 编译
+## 测试
 
-保持你现有 GitHub Actions 旧 arm64e 环境：
+找一个明确的 60fps 视频，依次测试 1x / 2x / 3x。
 
-```bash
-make clean package FINALPACKAGE=1 messages=yes
-```
+如果 1x ≈60、2x ≈120，说明 IJK 本身已能在 2x 时完整输出 120 个源帧/秒。
+如果 1x ≈60、2x 仍≈60，则下一步需要修改 IJK 的视频调度/丢帧逻辑。
 
-目标：iOS 13.0，SDK 13.7，arm64 + arm64e。
+如果仍显示 `VID --`，请同时记录 `E?/I?` 两个状态，并把 Bilibili Documents 里的日志发回。

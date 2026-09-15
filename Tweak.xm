@@ -8,7 +8,7 @@
 #include <string.h>
 
 /*
- * BiliVideoFPS120 0.1.1
+ * BiliVideoFPS120 0.1.3
  *
  * Why 0.1.0 could show VID -- / SRC -- forever:
  * Bilibili can load its ijkplayer classes after tweak construction. A Logos
@@ -29,17 +29,20 @@
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event { (void)point; (void)event; return NO; }
 @end
 
-static NSString * const GTLogPath = @"/var/mobile/Media/BiliVideoFPS120.log";
+static NSString *GTLogPath = nil;
 static dispatch_queue_t GTLogQueue;
 static __weak id gActivePlayer = nil;
 static float gPlaybackRate = 1.0f;
 
 static volatile uint64_t gVideoSubmitCount = 0;
 static volatile uint64_t gVideoEverSubmitted = 0;
+static volatile uint64_t gEAGLPresentCount = 0;
+static volatile uint64_t gEAGLEverPresented = 0;
 
 static BOOL gPlayerHooked = NO;
 static BOOL gOptionsHooked = NO;
 static BOOL gGLHooked = NO;
+static BOOL gEAGLHooked = NO;
 static int gInstallAttempt = 0;
 
 static NSInteger GTMaxScreenFPS(void) {
@@ -76,6 +79,7 @@ typedef void (*GTVoidIMP)(id, SEL);
 typedef void (*GTRateIMP)(id, SEL, float);
 typedef void (*GTOptionIMP)(id, SEL, int64_t, NSString *);
 typedef void (*GTDisplayIMP)(id, SEL, void *);
+typedef BOOL (*GTEAGLPresentIMP)(id, SEL, NSUInteger);
 
 static GTInitPlayerIMP origPlayerInit = NULL;
 static GTVoidIMP origPrepareToPlay = NULL;
@@ -83,6 +87,7 @@ static GTVoidIMP origPlay = NULL;
 static GTRateIMP origSetPlaybackRate = NULL;
 static GTOptionIMP origOptionsSetInt = NULL;
 static GTDisplayIMP origGLDisplay = NULL;
+static GTEAGLPresentIMP origEAGLPresent = NULL;
 
 static void GTSetMaxFPSOnObject(id obj) {
     SEL s = NSSelectorFromString(@"setPlayerOptionIntValue:forKey:");
@@ -130,6 +135,19 @@ static void hookGLDisplay(id self, SEL _cmd, void *overlay) {
     }
 }
 
+
+static BOOL hookEAGLPresent(id self, SEL _cmd, NSUInteger target) {
+    BOOL ok = origEAGLPresent ? origEAGLPresent(self, _cmd, target) : NO;
+    // GL_RENDERBUFFER = 0x8D41. Count successful presents only. UIKit/CoreAnimation
+    // does not use EAGL presentRenderbuffer:, so in this old Bilibili build this is
+    // a much more reliable video-output probe than depending on a private IJK class name.
+    if (ok && target == 0x8D41) {
+        __atomic_add_fetch(&gEAGLPresentCount, 1ULL, __ATOMIC_RELAXED);
+        __atomic_store_n(&gEAGLEverPresented, 1ULL, __ATOMIC_RELAXED);
+    }
+    return ok;
+}
+
 static BOOL GTHookIfPresent(Class cls, SEL sel, IMP replacement, IMP *origOut) {
     if (!cls) return NO;
     Method m = class_getInstanceMethod(cls, sel);
@@ -165,6 +183,14 @@ static void GTLogCandidatesOnce(void) {
 static void GTInstallRuntimeHooks(void) {
     gInstallAttempt++;
 
+    if (!gEAGLHooked) {
+        Class eagl = NSClassFromString(@"EAGLContext");
+        if (GTHookIfPresent(eagl, NSSelectorFromString(@"presentRenderbuffer:"), (IMP)hookEAGLPresent, (IMP *)&origEAGLPresent)) {
+            gEAGLHooked = YES;
+            GTLog(@"HOOK OK EAGLContext presentRenderbuffer:");
+        }
+    }
+
     if (!gOptionsHooked) {
         Class c = NSClassFromString(@"IJKFFOptions");
         if (GTHookIfPresent(c, NSSelectorFromString(@"setPlayerOptionIntValue:forKey:"), (IMP)hookOptionsSetInt, (IMP *)&origOptionsSetInt)) {
@@ -198,13 +224,13 @@ static void GTInstallRuntimeHooks(void) {
         }
     }
 
-    if ((gPlayerHooked && gGLHooked) || gInstallAttempt >= 40) {
-        GTLog(@"HOOK STATUS attempts=%d player=%d options=%d gl=%d", gInstallAttempt, gPlayerHooked, gOptionsHooked, gGLHooked);
-        if (!gPlayerHooked || !gGLHooked) GTLogCandidatesOnce();
+    if ((gPlayerHooked && (gGLHooked || gEAGLHooked)) || gInstallAttempt >= 120) {
+        GTLog(@"HOOK STATUS attempts=%d player=%d options=%d ijkGL=%d eagl=%d", gInstallAttempt, gPlayerHooked, gOptionsHooked, gGLHooked, gEAGLHooked);
+        if (!gPlayerHooked || (!gGLHooked && !gEAGLHooked)) GTLogCandidatesOnce();
         return;
     }
 
-    // IJK is often dlopened after tweak construction. Keep retrying for 20 s.
+    // Keep retrying for up to 60 s; some old Bilibili builds dlopen the renderer only when playback starts.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         GTInstallRuntimeHooks();
     });
@@ -217,6 +243,7 @@ static void GTInstallRuntimeHooks(void) {
 @property(nonatomic, strong) UILabel *label;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic) uint64_t lastFrames;
+@property(nonatomic) uint64_t lastEAGLFrames;
 @property(nonatomic) CFTimeInterval lastSampleTime;
 @property(nonatomic) double smoothedVideoFPS;
 + (instancetype)shared;
@@ -312,12 +339,17 @@ static void GTInstallRuntimeHooks(void) {
     [self layoutOverlay];
     CFTimeInterval now = CACurrentMediaTime();
     uint64_t frames = __atomic_load_n(&gVideoSubmitCount, __ATOMIC_RELAXED);
-    if (self.lastSampleTime <= 0.0) { self.lastSampleTime = now; self.lastFrames = frames; return; }
+    uint64_t eaglFrames = __atomic_load_n(&gEAGLPresentCount, __ATOMIC_RELAXED);
+    if (self.lastSampleTime <= 0.0) { self.lastSampleTime = now; self.lastFrames = frames; self.lastEAGLFrames = eaglFrames; return; }
     double dt = now - self.lastSampleTime;
-    uint64_t df = frames - self.lastFrames;
-    self.lastSampleTime = now; self.lastFrames = frames;
+    uint64_t dfIJK = frames - self.lastFrames;
+    uint64_t dfEAGL = eaglFrames - self.lastEAGLFrames;
+    self.lastSampleTime = now; self.lastFrames = frames; self.lastEAGLFrames = eaglFrames;
+    BOOL eaglEver = __atomic_load_n(&gEAGLEverPresented, __ATOMIC_RELAXED) != 0;
+    BOOL ijkEver = __atomic_load_n(&gVideoEverSubmitted, __ATOMIC_RELAXED) != 0;
+    uint64_t df = eaglEver ? dfEAGL : dfIJK;
     double instant = dt > 0.05 ? ((double)df / dt) : 0.0;
-    BOOL ever = __atomic_load_n(&gVideoEverSubmitted, __ATOMIC_RELAXED) != 0;
+    BOOL ever = eaglEver || ijkEver;
     if (ever) {
         if (self.smoothedVideoFPS <= 0.01 || instant <= 0.01) self.smoothedVideoFPS = instant;
         else self.smoothedVideoFPS = self.smoothedVideoFPS * 0.55 + instant * 0.45;
@@ -325,15 +357,21 @@ static void GTInstallRuntimeHooks(void) {
     double src = [self sourceFPSFromActivePlayer];
     NSString *vidText = ever ? [NSString stringWithFormat:@"%.1f", self.smoothedVideoFPS] : @"--";
     NSString *srcText = src > 0.05 ? [NSString stringWithFormat:@"%.0f", src] : @"--";
-    self.label.text = [NSString stringWithFormat:@"VID %@ | SRC %@ | %.1fx", vidText, srcText, gPlaybackRate];
+    if (ever) {
+        self.label.text = [NSString stringWithFormat:@"VID %@ | SRC %@ | %.1fx", vidText, srcText, gPlaybackRate];
+    } else {
+        // Compact diagnostic when no frame has been seen yet. E=EAGL hook, I=IJK display hook.
+        self.label.text = [NSString stringWithFormat:@"VID -- | E%d I%d | %.1fx", gEAGLHooked ? 1 : 0, gGLHooked ? 1 : 0, gPlaybackRate];
+    }
     static int div = 0;
-    if ((++div % 2) == 0) GTLog(@"FPS submit=%.3f src=%.3f rate=%.3f player=%@ hooked(P/O/G)=%d/%d/%d", instant, src, gPlaybackRate, gActivePlayer ? NSStringFromClass([gActivePlayer class]) : @"nil", gPlayerHooked, gOptionsHooked, gGLHooked);
+    if ((++div % 2) == 0) GTLog(@"FPS chosen=%.3f eaglDelta=%llu ijkDelta=%llu src=%.3f rate=%.3f player=%@ hooked(P/O/I/E)=%d/%d/%d/%d", instant, (unsigned long long)dfEAGL, (unsigned long long)dfIJK, src, gPlaybackRate, gActivePlayer ? NSStringFromClass([gActivePlayer class]) : @"nil", gPlayerHooked, gOptionsHooked, gGLHooked, gEAGLHooked);
 }
 - (void)start {
     if (self.timer) return;
     [self buildOverlay];
     self.lastSampleTime = CACurrentMediaTime();
     self.lastFrames = __atomic_load_n(&gVideoSubmitCount, __ATOMIC_RELAXED);
+    self.lastEAGLFrames = __atomic_load_n(&gEAGLPresentCount, __ATOMIC_RELAXED);
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
     [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
 }
@@ -363,7 +401,10 @@ static void GTInstallRuntimeHooks(void) {
         NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
         if (![bid isEqualToString:@"tv.danmaku.bilianime"]) return;
         GTLogQueue = dispatch_queue_create("com.chatgpt.bilivideofps120.log", DISPATCH_QUEUE_SERIAL);
-        GTLog(@"BiliVideoFPS120 0.1.2 START maxScreen=%ld", (long)GTMaxScreenFPS());
+        NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
+        GTLogPath = [docs stringByAppendingPathComponent:@"BiliVideoFPS120.log"];
+        GTLog(@"BiliVideoFPS120 0.1.3 START maxScreen=%ld home=%@ log=%@", (long)GTMaxScreenFPS(), NSHomeDirectory(), GTLogPath);
         dispatch_async(dispatch_get_main_queue(), ^{
             [[GTVOverlayController shared] start];
             GTInstallRuntimeHooks();
@@ -371,7 +412,7 @@ static void GTInstallRuntimeHooks(void) {
         // A later inventory makes diagnosis possible even if this Bilibili build
         // uses renamed/forked IJK classes.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (!gPlayerHooked || !gGLHooked) GTLogCandidatesOnce();
+            if (!gPlayerHooked || (!gGLHooked && !gEAGLHooked)) GTLogCandidatesOnce();
         });
     }
 }
