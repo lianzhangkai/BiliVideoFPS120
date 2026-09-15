@@ -5,15 +5,17 @@
 #import <objc/message.h>
 #import <substrate.h>
 #include <stdint.h>
+#include <dlfcn.h>
 
 /*
- * BiliVideoFPS120 0.1.7 SafeViewFPSProbe
+ * BiliVideoFPS120 0.1.8 CoreVFPSProbe
  *
  * Crash-safe diagnostic build after 0.1.6:
  * - DOES NOT hook EAGLContext, CAMetalLayer, AVSampleBufferDisplayLayer,
  *   IJKSDLGLView display:, or runtime third-party display_pixels: methods.
  * - Tracks only the known-working IJKFFMoviePlayerController methods.
- * - Reads controller.fpsAtOutput and controller.view.fps periodically.
+ * - Reads IJK core vfps/vdps directly through ijkmp_get_property_float when available.
+ * - Keeps controller.fpsAtOutput and controller.view.fps only as fallbacks.
  * - Reads source FPS from fpsInMeta / monitor.fps.
  * - Keeps the already-proven max-fps 60 -> 120 lift and Bilibili
  *   CADisplayLink 60 -> 120 lift.
@@ -34,6 +36,53 @@ static float gPlaybackRate = 1.0f;
 static BOOL gPlayerHooked = NO;
 static BOOL gOptionsHooked = NO;
 static int gInstallAttempt = 0;
+
+// IJK core property IDs from ff_ffmsg.h
+#define GT_FFP_PROP_FLOAT_VIDEO_DECODE_FPS 10001
+#define GT_FFP_PROP_FLOAT_VIDEO_OUTPUT_FPS 10002
+#define GT_FFP_PROP_FLOAT_PLAYBACK_RATE    10003
+
+typedef float (*GTIJKGetPropertyFloatFn)(void *mp, int id, float defaultValue);
+static GTIJKGetPropertyFloatFn gIJKGetPropertyFloat = NULL;
+static BOOL gTriedResolveIJKCore = NO;
+static Ivar gMediaPlayerIvar = NULL;
+
+static void GTLog(NSString *format, ...);
+
+static void GTResolveIJKCoreSymbols(void) {
+    if (gTriedResolveIJKCore) return;
+    gTriedResolveIJKCore = YES;
+
+    void *sym = dlsym(RTLD_DEFAULT, "ijkmp_get_property_float");
+    if (!sym) sym = MSFindSymbol(NULL, "_ijkmp_get_property_float");
+    gIJKGetPropertyFloat = (GTIJKGetPropertyFloatFn)sym;
+    GTLog(@"CORE symbol ijkmp_get_property_float=%p", sym);
+}
+
+static void *GTGetMediaPlayerPointer(id player) {
+    if (!player) return NULL;
+    if (!gMediaPlayerIvar) {
+        Class c = [player class];
+        while (c && !gMediaPlayerIvar) {
+            gMediaPlayerIvar = class_getInstanceVariable(c, "_mediaPlayer");
+            c = class_getSuperclass(c);
+        }
+        GTLog(@"CORE ivar _mediaPlayer=%p", gMediaPlayerIvar);
+    }
+    if (!gMediaPlayerIvar) return NULL;
+    ptrdiff_t off = ivar_getOffset(gMediaPlayerIvar);
+    uint8_t *base = (uint8_t *)(__bridge void *)player;
+    return *(void **)(base + off);
+}
+
+static double GTReadCoreProperty(id player, int prop) {
+    GTResolveIJKCoreSymbols();
+    if (!gIJKGetPropertyFloat) return 0.0;
+    void *mp = GTGetMediaPlayerPointer(player);
+    if (!mp) return 0.0;
+    float f = gIJKGetPropertyFloat(mp, prop, 0.0f);
+    return (f > 0.001f && f < 1000.0f) ? (double)f : 0.0;
+}
 
 static NSInteger GTMaxScreenFPS(void) {
     UIScreen *s = [UIScreen mainScreen];
@@ -293,20 +342,24 @@ static double GTSourceFPS(id player) {
     if (player) GTRefreshRenderView(player);
     id view = gActiveRenderView;
 
+    double coreOut = GTReadCoreProperty(player, GT_FFP_PROP_FLOAT_VIDEO_OUTPUT_FPS);
+    double coreDec = GTReadCoreProperty(player, GT_FFP_PROP_FLOAT_VIDEO_DECODE_FPS);
+    double coreRate = GTReadCoreProperty(player, GT_FFP_PROP_FLOAT_PLAYBACK_RATE);
     double viewFPS = GTReadCGFloatSelector(view, @"fps");
     double controllerFPS = GTReadCGFloatSelector(player, @"fpsAtOutput");
     double src = GTSourceFPS(player);
 
-    double out = viewFPS > 0.05 ? viewFPS : controllerFPS;
-    NSString *backend = viewFPS > 0.05 ? @"VIEW" : (controllerFPS > 0.05 ? @"OUT" : @"--");
+    double out = coreOut > 0.05 ? coreOut : (viewFPS > 0.05 ? viewFPS : controllerFPS);
+    NSString *backend = coreOut > 0.05 ? @"CORE" : (viewFPS > 0.05 ? @"VIEW" : (controllerFPS > 0.05 ? @"OUT" : @"--"));
     NSString *vidText = out > 0.05 ? [NSString stringWithFormat:@"%.1f", out] : @"--";
     NSString *srcText = src > 0.05 ? [NSString stringWithFormat:@"%.0f", src] : @"--";
-    self.label.text = [NSString stringWithFormat:@"VID %@ %@ | SRC %@ | %.1fx", vidText, backend, srcText, gPlaybackRate];
+    double shownRate = coreRate > 0.05 ? coreRate : (double)gPlaybackRate;
+    self.label.text = [NSString stringWithFormat:@"VID %@ %@ | SRC %@ | %.1fx", vidText, backend, srcText, shownRate];
 
     static int div = 0;
     if ((++div % 2) == 0) {
-        GTLog(@"FPS view=%.3f controller=%.3f src=%.3f rate=%.3f player=%@ view=%@",
-              viewFPS, controllerFPS, src, gPlaybackRate,
+        GTLog(@"FPS coreOut=%.3f coreDec=%.3f coreRate=%.3f view=%.3f controller=%.3f src=%.3f hookRate=%.3f player=%@ view=%@",
+              coreOut, coreDec, coreRate, viewFPS, controllerFPS, src, gPlaybackRate,
               player ? NSStringFromClass([player class]) : @"nil",
               view ? NSStringFromClass([view class]) : @"nil");
     }
@@ -342,7 +395,7 @@ static double GTSourceFPS(id player) {
         NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
         [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
         GTLogPath = [docs stringByAppendingPathComponent:@"BiliVideoFPS120.log"];
-        GTLog(@"BiliVideoFPS120 0.1.7 START maxScreen=%ld home=%@ log=%@", (long)GTMaxScreenFPS(), NSHomeDirectory(), GTLogPath);
+        GTLog(@"BiliVideoFPS120 0.1.8 START maxScreen=%ld home=%@ log=%@", (long)GTMaxScreenFPS(), NSHomeDirectory(), GTLogPath);
         dispatch_async(dispatch_get_main_queue(), ^{
             [[GTVOverlayController shared] start];
             GTInstallRuntimeHooks();

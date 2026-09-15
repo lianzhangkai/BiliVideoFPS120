@@ -1,52 +1,34 @@
-# BiliVideoFPS120 0.1.7 SafeViewFPSProbe
+# BiliVideoFPS120 0.1.8 CoreVFPSProbe
 
-这是 0.1.6 闪退后的安全诊断版。
+这一版继续保持 0.1.7 的“安全探针”原则，不 Hook 视频渲染函数。
 
-## 关键变化
+## 新增
 
-0.1.7 删除所有高风险渲染后端 Hook：
+直接读取 IJK 核心内部统计：
 
-- 不 Hook `EAGLContext -presentRenderbuffer:`
-- 不 Hook `CAMetalLayer -nextDrawable`
-- 不 Hook `AVSampleBufferDisplayLayer -enqueueSampleBuffer:`
-- 不 Hook `IJKSDLGLView -display:`
-- 不动态 Hook 第三方 View 的 `display_pixels:`
+- `FFP_PROP_FLOAT_VIDEO_OUTPUT_FRAMES_PER_SECOND` (10002) → 实际送入视频输出链的 FPS
+- `FFP_PROP_FLOAT_VIDEO_DECODE_FRAMES_PER_SECOND` (10001) → 解码 FPS（写日志）
+- `FFP_PROP_FLOAT_PLAYBACK_RATE` (10003) → IJK 核心实际倍速
 
-只保留此前已验证不会导致闪退的：
+实现方式：从 `IJKFFMoviePlayerController` 的 `_mediaPlayer` ivar 取得 IjkMediaPlayer 指针，再调用已经加载的 `ijkmp_get_property_float`。不会动态 Hook `display_pixels:` / EAGL / Metal / SampleBuffer。
 
-- `IJKFFMoviePlayerController -prepareToPlay`
-- `-play`
-- `-setPlaybackRate:`
-- `IJKFFOptions max-fps 60 -> 120`
-- B站内 `CADisplayLink 60 -> 120`
+优先显示：
 
-## FPS 检测方式
-
-每 0.5 秒直接读取：
-
-1. `IJKFFMoviePlayerController.view`
-2. `view.fps`
-3. `IJKFFMoviePlayerController.fpsAtOutput`
-4. `fpsInMeta` / `monitor.fps`
-
-显示示例：
-
-`VID 59.9 VIEW | SRC 60 | 1.0x`
-
-如果 VIEW 没有值但 controller 有：
-
-`VID 59.9 OUT | SRC 60 | 1.0x`
-
-## 日志
-
-B站数据容器的：
-
-`Documents/BiliVideoFPS120.log`
-
-会记录实际 `player.view` 的类名、layer 类名、是否实现 `fps` / `display_pixels:` / `display:`。
-
-## 编译
-
-```bash
-make clean package FINALPACKAGE=1 messages=yes
 ```
+VID 59.8 CORE | SRC 60 | 1.0x
+VID 118.4 CORE | SRC 60 | 2.0x
+```
+
+如果核心符号不可解析，会自动退回 0.1.7 的 `view.fps` / `fpsAtOutput`。
+
+## 测试重点
+
+找明确 60fps 视频：
+
+- 1×：记录 VID / SRC
+- 2×：记录 VID / SRC
+
+若 `SRC 60 + 2.0x` 时 `VID ≈ 115~120 CORE`，说明 IJK 已经完整输出约 120 个源帧/秒。
+若仍 `VID ≈ 60 CORE`，再进入 video_refresh / 丢帧逻辑修改阶段。
+
+日志仍在 B站数据容器 `Documents/BiliVideoFPS120.log`。
