@@ -1,45 +1,32 @@
-# BiliVideoFPS120 0.1.0 — 实际视频 FPS 探针 + 安全 120fps 上限放宽
+# BiliVideoFPS120 0.1.1 — LateLoad + 真视频帧提交计数
 
-目标设备：iPad Pro 2018 / iPadOS 13.7 / Odyssey-libhooker / arm64e。
+这是 0.1.0 的修正版。0.1.0 如果一直显示 `VID -- | SRC --`，最可能的原因是 B站把 ijkplayer 动态加载得较晚，Tweak 构造时 `IJKFFMoviePlayerController` 还不存在，固定 Logos hook 没挂上。
 
-## 这一版做什么
+0.1.1 的改动：
 
-1. 实时读取 ijkplayer 自己的 `fpsInMeta` 和 `fpsAtOutput`：
-   - `SRC` = 视频源标称 FPS；
-   - `VID` = IJKSDLGLView 实际输出/提交 FPS；
-   - 同时显示当前 `playbackRate`。
-2. 状态栏约 3/5 位置显示：`VID 59.9 | SRC 60 | 2.0x`，避免和 GlobalFPSOverlay 0.2.0（4/5位置）重叠。
-3. 在 ProMotion 120Hz 设备上把 ijkplayer 的 `max-fps` 安全提升到 120，避免 60fps 源视频因为旧的 30/60fps 上限被提前丢帧。
-4. 将 B站内部显式请求 60fps 的 `CADisplayLink` 提升到 120（主要针对 UI/弹幕）。
-5. **不强制 framedrop=0**。3×播放 60fps 视频理论需要 180帧/秒，120Hz 屏幕不可能完整显示，播放器仍需要正常丢掉来不及显示的帧。
+- 不再假设 IJK 类在启动时已经存在；每 0.5 秒重试，最多约 20 秒。
+- 直接 hook `IJKSDLGLView -display:`，只统计非 NULL overlay 的真实视频帧提交次数。因此即使 controller 的 `fpsAtOutput` 不可用，`VID` 也应该能显示。
+- `SRC` 仍优先读取 `IJKFFMoviePlayerController -fpsInMeta`；如果这个 B站版本没有该接口，SRC 可能仍显示 `--`，但不影响最关键的 VID 实测。
+- 保留 `max-fps=120` 的安全放宽。
+- 保留 B站进程内 `CADisplayLink 60 -> 120` / `frameInterval 2 -> 1`。
+- 日志会记录 IJK/KSY 候选类和 hook 状态，便于继续定位私有 fork。
 
-## 最重要的测试
+## 测试重点
 
-找一个确定为 60fps 的 B站视频：
+找一个明确 60fps 视频，分别看：
 
-- 1× 播放 15 秒，记录 `VID / SRC`；
-- 2× 播放 20 秒，记录 `VID / SRC`；
-- 长按 3× 播放 15 秒，记录 `VID / SRC`。
+- 1x：VID 是否约 60
+- 2x：VID 是约 60 还是约 120
+- 3x：VID 上限预期不超过约 120
 
-### 结果怎么解释
-
-- `SRC≈60，1× VID≈60，2× VID≈115~120`：已经实现“60fps源 × 2 = 真120fps输出”，无需继续改视频调度器。
-- `SRC≈60，2× VID仍≈60`：倍速时 IJK 在视频时钟/late-frame 路径丢了一半帧，下一版要针对 video refresh / framedrop 做动态策略。
-- `SRC≈60，3× VID≈115~120`：正常且已经接近屏幕上限；3×不可能完整显示180个不同源帧。
-- `SRC≈30，2× VID≈60`：同样是正常的真2×完整帧输出。
-
-日志：`/var/mobile/Media/BiliVideoFPS120.log`
-
-## 和现有插件的关系
-
-- 可和 `GlobalTimePitchFix 0.8.0` 共存；本插件不改音频 PCM/DSP。
-- 可和 `GlobalFPSOverlay 0.2.0` 共存；GlobalFPSOverlay显示 App/UI DisplayLink FPS，本插件显示 IJK 实际视频输出 FPS。
-- 如果之前装过独立的 `Bili120HzUnlock` 实验包，建议先卸载它，避免重复 hook `CADisplayLink`。
+如果 `VID` 有数值而 `SRC` 还是 `--`，已经足够判断倍速时是否真的把源帧送满 120Hz。若 VID 仍为 `--`，把 `/var/mobile/Media/BiliVideoFPS120.log` 发回来，里面会列出实际加载的 IJK/KSY 类名。
 
 ## 编译
 
-仓库根目录运行 GitHub Actions，或：
+保持你现有 GitHub Actions 旧 arm64e 环境：
 
 ```bash
 make clean package FINALPACKAGE=1 messages=yes
 ```
+
+目标：iOS 13.0，SDK 13.7，arm64 + arm64e。
