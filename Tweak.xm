@@ -343,12 +343,18 @@ static void GTInstallRuntimeHooks(void) {
 
 %hook CADisplayLink
 - (void)setPreferredFramesPerSecond:(NSInteger)fps {
-    if (GTIsProMotion120() && fps == 60) { %orig(120); return; }
-    %orig(fps);
+    NSInteger adjustedFPS = fps;
+    if (GTIsProMotion120() && fps == 60) {
+        adjustedFPS = 120;
+    }
+    %orig(adjustedFPS);
 }
 - (void)setFrameInterval:(NSInteger)interval {
-    if (GTIsProMotion120() && interval == 2) { %orig(1); return; }
-    %orig(interval);
+    NSInteger adjustedInterval = interval;
+    if (GTIsProMotion120() && interval == 2) {
+        adjustedInterval = 1;
+    }
+    %orig(adjustedInterval);
 }
 %end
 
@@ -357,7 +363,7 @@ static void GTInstallRuntimeHooks(void) {
         NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
         if (![bid isEqualToString:@"tv.danmaku.bilianime"]) return;
         GTLogQueue = dispatch_queue_create("com.chatgpt.bilivideofps120.log", DISPATCH_QUEUE_SERIAL);
-        GTLog(@"BiliVideoFPS120 0.1.1 START maxScreen=%ld", (long)GTMaxScreenFPS());
+        GTLog(@"BiliVideoFPS120 0.1.2 START maxScreen=%ld", (long)GTMaxScreenFPS());
         dispatch_async(dispatch_get_main_queue(), ^{
             [[GTVOverlayController shared] start];
             GTInstallRuntimeHooks();

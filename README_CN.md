@@ -1,8 +1,10 @@
-# BiliVideoFPS120 0.1.1 — LateLoad + 真视频帧提交计数
+# BiliVideoFPS120 0.1.2 — LateLoad + 真视频帧提交计数
 
-这是 0.1.0 的修正版。0.1.0 如果一直显示 `VID -- | SRC --`，最可能的原因是 B站把 ijkplayer 动态加载得较晚，Tweak 构造时 `IJKFFMoviePlayerController` 还不存在，固定 Logos hook 没挂上。
+这是 0.1.1 的编译修正版。0.1.0 如果一直显示 `VID -- | SRC --`，最可能的原因是 B站把 ijkplayer 动态加载得较晚，Tweak 构造时 `IJKFFMoviePlayerController` 还不存在，固定 Logos hook 没挂上。
 
-0.1.1 的改动：
+0.1.2 保留 0.1.1 的功能，并修复 Theos/Logos 预处理错误：`%orig(120)` / `%orig(1)` 改为先写入局部变量，再调用 `%orig(variable)`。
+
+核心功能：
 
 - 不再假设 IJK 类在启动时已经存在；每 0.5 秒重试，最多约 20 秒。
 - 直接 hook `IJKSDLGLView -display:`，只统计非 NULL overlay 的真实视频帧提交次数。因此即使 controller 的 `fpsAtOutput` 不可用，`VID` 也应该能显示。
