@@ -1,31 +1,52 @@
-# BiliVideoFPS120 0.1.3 — EAGL Present Probe
+# BiliVideoFPS120 0.1.5 — ThirdGLView Probe
 
-本版用于解决 0.1.2 中 `VID --` 且 `/var/mobile/Media/BiliVideoFPS120.log` 不存在的问题。
+针对 0.1.3 日志已经确认的情况：
 
-## 关键变化
+- `IJKFFMoviePlayerController` 确实是当前播放器；
+- `setPlaybackRate:` 能抓到 1×/3×；
+- B站把 IJK `max-fps` 设为 60，插件已改为 120；
+- 但标准 `IJKSDLGLView -display:` 与 `EAGLContext -presentRenderbuffer:` 都没有帧。
 
-- 不再依赖 `IJKSDLGLView -display:` 才能统计视频帧。
-- 新增对系统 `EAGLContext -presentRenderbuffer:` 的进程内 Hook。老版 ijkplayer 每真正提交一帧 OpenGL 视频时都会调用这里，因此它可以绕过 B站私有/改名 IJK 类。
-- `IJKSDLGLView -display:` 仍保留为辅助计数器。
-- 日志改写入 Bilibili 自己的沙盒 Documents，避免 App Sandbox 拒绝写 `/var/mobile/Media/`。
-- 未检测到帧时，浮层显示 `VID -- | E1 I0 | 1.0x`：`E1` 表示 EAGL present hook 已安装；`I1` 表示 IJKSDLGLView display hook 已安装。
-- 运行时 IJK Hook 重试窗口从约 20 秒延长到约 60 秒。
+这强烈说明当前 B站版本使用了 IJK 的 **第三方 GL View** 通道。公开的 IJK 接口 `IJKSDLGLViewProtocol` 对第三方渲染器定义的是 `-display_pixels:`，而 `IJKFFMoviePlayerController` 也提供 `initWithMoreContent...withGLView:` 来注入第三方 View。
 
-## 日志位置
+## 0.1.5 新增
 
-Filza → 应用管理器 → Bilibili → 数据容器 → Documents → `BiliVideoFPS120.log`
+1. 在 `prepareToPlay/play/setPlaybackRate:` 时直接读取当前 IJK player 的 `view`。
+2. 记录实际渲染 View 的类名、Layer 类型、`isThirdGLView`。
+3. **动态 Hook 实际 View 类的 `display_pixels:`**，统计 IJK 向第三方渲染器提交的真实视频帧数。
+4. 如果该 View 自己实现 `fps`，也作为备用输出 FPS（显示后缀 `VFP`）。
+5. `SRC` 除 `fpsInMeta` 外，再使用 `IJKFFMonitor.fps` 回退，解决部分 fork 中 SRC 一直 `--`。
+6. 保留 `max-fps 60 -> 120`、SampleBuffer / EAGL / Metal 多后端探测、B站 UI 60→120 CADisplayLink 提升。
 
-物理路径会是：
+## 显示
 
-`/var/mobile/Containers/Data/Application/<Bilibili UUID>/Documents/BiliVideoFPS120.log`
+优先命中第三方渲染通道时：
 
-UUID 每次重装 App 都可能改变。
+```
+VID 59.8 PIX | SRC 60 | 1.0x
+VID 118.6 PIX | SRC 60 | 2.0x
+```
 
-## 测试
+`PIX` = IJK `display_pixels:` 的提交频率。
 
-找一个明确的 60fps 视频，依次测试 1x / 2x / 3x。
+如果只拿到渲染 View 自带的 fps：
 
-如果 1x ≈60、2x ≈120，说明 IJK 本身已能在 2x 时完整输出 120 个源帧/秒。
-如果 1x ≈60、2x 仍≈60，则下一步需要修改 IJK 的视频调度/丢帧逻辑。
+```
+VID 59.8 VFP | SRC 60 | 1.0x
+```
 
-如果仍显示 `VID --`，请同时记录 `E?/I?` 两个状态，并把 Bilibili Documents 里的日志发回。
+仍未命中时会显示：
+
+```
+VID -- | H P1 T1 E1 I1 S1 M1 | 1.0x
+```
+
+其中 `T1` 表示实际播放器 View 的 `display_pixels:` Hook 已安装。
+
+日志：B站沙盒 `Documents/BiliVideoFPS120.log`。
+
+## 编译
+
+```bash
+make clean package FINALPACKAGE=1 messages=yes
+```

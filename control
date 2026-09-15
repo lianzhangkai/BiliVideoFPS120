@@ -1,8 +1,8 @@
 Package: com.chatgpt.bilivideofps120
 Name: BiliVideoFPS120
-Version: 0.1.3
+Version: 0.1.5
 Architecture: iphoneos-arm
-Description: Bilibili actual video output FPS probe using EAGL presentRenderbuffer fallback, sandbox-safe logging, late IJK hooks, and 120fps cap lift for iOS 13 ProMotion devices.
+Description: Bilibili multi-backend video FPS probe for IJK/EAGL, AVSampleBufferDisplayLayer, and CAMetalLayer with runtime view diagnostics and 120Hz cap lift on iOS 13 ProMotion devices.
 Maintainer: ChatGPT + user test build
 Author: ChatGPT + user test build
 Section: Tweaks

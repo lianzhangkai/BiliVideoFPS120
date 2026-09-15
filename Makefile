@@ -7,6 +7,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = BiliVideoFPS120
 BiliVideoFPS120_FILES = Tweak.xm
 BiliVideoFPS120_CFLAGS = -fobjc-arc -O2 -Wno-deprecated-declarations
-BiliVideoFPS120_FRAMEWORKS = Foundation UIKit QuartzCore
+BiliVideoFPS120_FRAMEWORKS = Foundation UIKit QuartzCore AVFoundation CoreMedia
 
 include $(THEOS_MAKE_PATH)/tweak.mk
