@@ -1,34 +1,25 @@
-# BiliVideoFPS120 0.1.8 CoreVFPSProbe
+# BiliVideoFPS120 0.1.9 HUDVFPSProbe
 
-这一版继续保持 0.1.7 的“安全探针”原则，不 Hook 视频渲染函数。
+针对 0.1.8 中 `SRC` 和倍速正常、但 `VID --` 的情况。
 
-## 新增
+本版不再直接查找 `ijkmp_get_property_float` 隐藏 C 符号，也不再从对象外部读取 `_mediaPlayer`。改为调用 IJKFFMoviePlayerController 自己的 `refreshHudView`，并只截获其 `fps` HUD 数据。IJK 自带 HUD 不会被打开。
 
-直接读取 IJK 核心内部统计：
+公开 ijkplayer 的 `refreshHudView` 会在播放器内部读取视频解码 FPS 与视频输出 FPS，然后写成：
 
-- `FFP_PROP_FLOAT_VIDEO_OUTPUT_FRAMES_PER_SECOND` (10002) → 实际送入视频输出链的 FPS
-- `FFP_PROP_FLOAT_VIDEO_DECODE_FRAMES_PER_SECOND` (10001) → 解码 FPS（写日志）
-- `FFP_PROP_FLOAT_PLAYBACK_RATE` (10003) → IJK 核心实际倍速
-
-实现方式：从 `IJKFFMoviePlayerController` 的 `_mediaPlayer` ivar 取得 IjkMediaPlayer 指针，再调用已经加载的 `ijkmp_get_property_float`。不会动态 Hook `display_pixels:` / EAGL / Metal / SampleBuffer。
-
-优先显示：
-
-```
-VID 59.8 CORE | SRC 60 | 1.0x
-VID 118.4 CORE | SRC 60 | 2.0x
+```text
+解码FPS / 输出FPS
 ```
 
-如果核心符号不可解析，会自动退回 0.1.7 的 `view.fps` / `fpsAtOutput`。
+本 tweak 取右侧作为 `VID`。显示示例：
 
-## 测试重点
+```text
+VID 59.9 HUD | SRC 30 | 2.0x
+```
 
-找明确 60fps 视频：
+仍保留 `max-fps -> 120`、B站 CADisplayLink 60 -> 120、SRC 与倍速监测。未恢复任何已知高风险渲染 Hook。
 
-- 1×：记录 VID / SRC
-- 2×：记录 VID / SRC
+编译：
 
-若 `SRC 60 + 2.0x` 时 `VID ≈ 115~120 CORE`，说明 IJK 已经完整输出约 120 个源帧/秒。
-若仍 `VID ≈ 60 CORE`，再进入 video_refresh / 丢帧逻辑修改阶段。
-
-日志仍在 B站数据容器 `Documents/BiliVideoFPS120.log`。
+```bash
+make clean package FINALPACKAGE=1 messages=yes
+```

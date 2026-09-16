@@ -5,16 +5,17 @@
 #import <objc/message.h>
 #import <substrate.h>
 #include <stdint.h>
-#include <dlfcn.h>
 
 /*
- * BiliVideoFPS120 0.1.8 CoreVFPSProbe
+ * BiliVideoFPS120 0.1.9 HUDVFPSProbe
  *
  * Crash-safe diagnostic build after 0.1.6:
  * - DOES NOT hook EAGLContext, CAMetalLayer, AVSampleBufferDisplayLayer,
  *   IJKSDLGLView display:, or runtime third-party display_pixels: methods.
  * - Tracks only the known-working IJKFFMoviePlayerController methods.
- * - Reads IJK core vfps/vdps directly through ijkmp_get_property_float when available.
+ * - DOES NOT resolve hidden ijkmp_* C symbols or read the _mediaPlayer ivar.
+ * - Uses IJKFFMoviePlayerController's own refreshHudView -> setHudValue:@"fps" path
+ *   to obtain decode/output FPS safely from inside the player itself.
  * - Keeps controller.fpsAtOutput and controller.view.fps only as fallbacks.
  * - Reads source FPS from fpsInMeta / monitor.fps.
  * - Keeps the already-proven max-fps 60 -> 120 lift and Bilibili
@@ -37,52 +38,11 @@ static BOOL gPlayerHooked = NO;
 static BOOL gOptionsHooked = NO;
 static int gInstallAttempt = 0;
 
-// IJK core property IDs from ff_ffmsg.h
-#define GT_FFP_PROP_FLOAT_VIDEO_DECODE_FPS 10001
-#define GT_FFP_PROP_FLOAT_VIDEO_OUTPUT_FPS 10002
-#define GT_FFP_PROP_FLOAT_PLAYBACK_RATE    10003
-
-typedef float (*GTIJKGetPropertyFloatFn)(void *mp, int id, float defaultValue);
-static GTIJKGetPropertyFloatFn gIJKGetPropertyFloat = NULL;
-static BOOL gTriedResolveIJKCore = NO;
-static Ivar gMediaPlayerIvar = NULL;
-
-static void GTLog(NSString *format, ...);
-
-static void GTResolveIJKCoreSymbols(void) {
-    if (gTriedResolveIJKCore) return;
-    gTriedResolveIJKCore = YES;
-
-    void *sym = dlsym(RTLD_DEFAULT, "ijkmp_get_property_float");
-    if (!sym) sym = MSFindSymbol(NULL, "_ijkmp_get_property_float");
-    gIJKGetPropertyFloat = (GTIJKGetPropertyFloatFn)sym;
-    GTLog(@"CORE symbol ijkmp_get_property_float=%p", sym);
-}
-
-static void *GTGetMediaPlayerPointer(id player) {
-    if (!player) return NULL;
-    if (!gMediaPlayerIvar) {
-        Class c = [player class];
-        while (c && !gMediaPlayerIvar) {
-            gMediaPlayerIvar = class_getInstanceVariable(c, "_mediaPlayer");
-            c = class_getSuperclass(c);
-        }
-        GTLog(@"CORE ivar _mediaPlayer=%p", gMediaPlayerIvar);
-    }
-    if (!gMediaPlayerIvar) return NULL;
-    ptrdiff_t off = ivar_getOffset(gMediaPlayerIvar);
-    uint8_t *base = (uint8_t *)(__bridge void *)player;
-    return *(void **)(base + off);
-}
-
-static double GTReadCoreProperty(id player, int prop) {
-    GTResolveIJKCoreSymbols();
-    if (!gIJKGetPropertyFloat) return 0.0;
-    void *mp = GTGetMediaPlayerPointer(player);
-    if (!mp) return 0.0;
-    float f = gIJKGetPropertyFloat(mp, prop, 0.0f);
-    return (f > 0.001f && f < 1000.0f) ? (double)f : 0.0;
-}
+// HUD FPS values captured from IJKFFMoviePlayerController -setHudValue:forKey:.
+static double gHUDDecodeFPS = 0.0;
+static double gHUDOutputFPS = 0.0;
+static CFTimeInterval gHUDFPSTimestamp = 0.0;
+static BOOL gHasRefreshHudView = NO;
 
 static NSInteger GTMaxScreenFPS(void) {
     UIScreen *s = [UIScreen mainScreen];
@@ -147,11 +107,13 @@ static void GTRefreshRenderView(id player) {
 typedef void (*GTVoidIMP)(id, SEL);
 typedef void (*GTRateIMP)(id, SEL, float);
 typedef void (*GTOptionIMP)(id, SEL, int64_t, NSString *);
+typedef void (*GTHudIMP)(id, SEL, NSString *, NSString *);
 
 static GTVoidIMP origPrepareToPlay = NULL;
 static GTVoidIMP origPlay = NULL;
 static GTRateIMP origSetPlaybackRate = NULL;
 static GTOptionIMP origOptionsSetInt = NULL;
+static GTHudIMP origSetHudValue = NULL;
 
 static void hookPrepare(id self, SEL _cmd) {
     gActivePlayer = self;
@@ -172,6 +134,28 @@ static void hookRate(id self, SEL _cmd, float rate) {
     GTLog(@"PLAYER rate=%.3f class=%@ obj=%p", rate, NSStringFromClass([self class]), self);
     if (origSetPlaybackRate) origSetPlaybackRate(self, _cmd, rate);
     GTRefreshRenderView(self);
+}
+
+static void hookSetHudValue(id self, SEL _cmd, NSString *value, NSString *key) {
+    if ([key isKindOfClass:[NSString class]] && [key isEqualToString:@"fps"] &&
+        [value isKindOfClass:[NSString class]]) {
+        // Standard IJK HUD format is "decodeFPS / outputFPS".
+        NSScanner *scanner = [NSScanner scannerWithString:value];
+        double dec = 0.0;
+        double out = 0.0;
+        BOOL gotDec = [scanner scanDouble:&dec];
+        [scanner scanUpToString:@"/" intoString:NULL];
+        if (![scanner isAtEnd]) {
+            [scanner scanString:@"/" intoString:NULL];
+        }
+        BOOL gotOut = [scanner scanDouble:&out];
+        if (gotDec && gotOut && dec >= 0.0 && dec < 1000.0 && out >= 0.0 && out < 1000.0) {
+            gHUDDecodeFPS = dec;
+            gHUDOutputFPS = out;
+            gHUDFPSTimestamp = CACurrentMediaTime();
+        }
+    }
+    if (origSetHudValue) origSetHudValue(self, _cmd, value, key);
 }
 
 static void hookOptionsSetInt(id self, SEL _cmd, int64_t value, NSString *key) {
@@ -209,12 +193,16 @@ static void GTInstallRuntimeHooks(void) {
             any |= GTHookIfPresent(c, NSSelectorFromString(@"prepareToPlay"), (IMP)hookPrepare, (IMP *)&origPrepareToPlay);
             any |= GTHookIfPresent(c, NSSelectorFromString(@"play"), (IMP)hookPlay, (IMP *)&origPlay);
             any |= GTHookIfPresent(c, NSSelectorFromString(@"setPlaybackRate:"), (IMP)hookRate, (IMP *)&origSetPlaybackRate);
+            any |= GTHookIfPresent(c, NSSelectorFromString(@"setHudValue:forKey:"), (IMP)hookSetHudValue, (IMP *)&origSetHudValue);
+            gHasRefreshHudView = class_getInstanceMethod(c, NSSelectorFromString(@"refreshHudView")) != NULL;
             if (any) {
                 gPlayerHooked = YES;
-                GTLog(@"HOOK OK IJKFFMoviePlayerController fpsInMeta=%d fpsAtOutput=%d view=%d",
+                GTLog(@"HOOK OK IJKFFMoviePlayerController fpsInMeta=%d fpsAtOutput=%d view=%d refreshHudView=%d setHudValue=%d",
                       class_getInstanceMethod(c, NSSelectorFromString(@"fpsInMeta")) != NULL,
                       class_getInstanceMethod(c, NSSelectorFromString(@"fpsAtOutput")) != NULL,
-                      class_getInstanceMethod(c, NSSelectorFromString(@"view")) != NULL);
+                      class_getInstanceMethod(c, NSSelectorFromString(@"view")) != NULL,
+                      gHasRefreshHudView,
+                      class_getInstanceMethod(c, NSSelectorFromString(@"setHudValue:forKey:")) != NULL);
             }
         }
     }
@@ -342,24 +330,41 @@ static double GTSourceFPS(id player) {
     if (player) GTRefreshRenderView(player);
     id view = gActiveRenderView;
 
-    double coreOut = GTReadCoreProperty(player, GT_FFP_PROP_FLOAT_VIDEO_OUTPUT_FPS);
-    double coreDec = GTReadCoreProperty(player, GT_FFP_PROP_FLOAT_VIDEO_DECODE_FPS);
-    double coreRate = GTReadCoreProperty(player, GT_FFP_PROP_FLOAT_PLAYBACK_RATE);
+    // refreshHudView is IJK's own diagnostic method. It reads _mediaPlayer internally
+    // and publishes the result as setHudValue:@"decode / output" forKey:@"fps".
+    // Calling it here does not enable or reveal IJK's built-in HUD.
+    if (player && gHasRefreshHudView) {
+        SEL refreshSel = NSSelectorFromString(@"refreshHudView");
+        if ([player respondsToSelector:refreshSel]) {
+            ((void(*)(id,SEL))objc_msgSend)(player, refreshSel);
+        }
+    }
+
+    double hudOut = 0.0;
+    double hudDec = 0.0;
+    CFTimeInterval hudAge = 9999.0;
+    if (gHUDFPSTimestamp > 0.0) {
+        hudAge = CACurrentMediaTime() - gHUDFPSTimestamp;
+        if (hudAge < 2.0) {
+            hudOut = gHUDOutputFPS;
+            hudDec = gHUDDecodeFPS;
+        }
+    }
+
     double viewFPS = GTReadCGFloatSelector(view, @"fps");
     double controllerFPS = GTReadCGFloatSelector(player, @"fpsAtOutput");
     double src = GTSourceFPS(player);
 
-    double out = coreOut > 0.05 ? coreOut : (viewFPS > 0.05 ? viewFPS : controllerFPS);
-    NSString *backend = coreOut > 0.05 ? @"CORE" : (viewFPS > 0.05 ? @"VIEW" : (controllerFPS > 0.05 ? @"OUT" : @"--"));
+    double out = hudOut > 0.05 ? hudOut : (viewFPS > 0.05 ? viewFPS : controllerFPS);
+    NSString *backend = hudOut > 0.05 ? @"HUD" : (viewFPS > 0.05 ? @"VIEW" : (controllerFPS > 0.05 ? @"OUT" : @"--"));
     NSString *vidText = out > 0.05 ? [NSString stringWithFormat:@"%.1f", out] : @"--";
     NSString *srcText = src > 0.05 ? [NSString stringWithFormat:@"%.0f", src] : @"--";
-    double shownRate = coreRate > 0.05 ? coreRate : (double)gPlaybackRate;
-    self.label.text = [NSString stringWithFormat:@"VID %@ %@ | SRC %@ | %.1fx", vidText, backend, srcText, shownRate];
+    self.label.text = [NSString stringWithFormat:@"VID %@ %@ | SRC %@ | %.1fx", vidText, backend, srcText, (double)gPlaybackRate];
 
     static int div = 0;
     if ((++div % 2) == 0) {
-        GTLog(@"FPS coreOut=%.3f coreDec=%.3f coreRate=%.3f view=%.3f controller=%.3f src=%.3f hookRate=%.3f player=%@ view=%@",
-              coreOut, coreDec, coreRate, viewFPS, controllerFPS, src, gPlaybackRate,
+        GTLog(@"FPS hudOut=%.3f hudDec=%.3f hudAge=%.3f view=%.3f controller=%.3f src=%.3f hookRate=%.3f refresh=%d player=%@ view=%@",
+              hudOut, hudDec, hudAge, viewFPS, controllerFPS, src, gPlaybackRate, gHasRefreshHudView,
               player ? NSStringFromClass([player class]) : @"nil",
               view ? NSStringFromClass([view class]) : @"nil");
     }
@@ -395,7 +400,7 @@ static double GTSourceFPS(id player) {
         NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
         [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
         GTLogPath = [docs stringByAppendingPathComponent:@"BiliVideoFPS120.log"];
-        GTLog(@"BiliVideoFPS120 0.1.8 START maxScreen=%ld home=%@ log=%@", (long)GTMaxScreenFPS(), NSHomeDirectory(), GTLogPath);
+        GTLog(@"BiliVideoFPS120 0.1.9 START maxScreen=%ld home=%@ log=%@", (long)GTMaxScreenFPS(), NSHomeDirectory(), GTLogPath);
         dispatch_async(dispatch_get_main_queue(), ^{
             [[GTVOverlayController shared] start];
             GTInstallRuntimeHooks();
