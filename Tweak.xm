@@ -4,22 +4,20 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <substrate.h>
-#include <dlfcn.h>
+#include <stdlib.h>
 #include <stdint.h>
 
 /*
- * BiliVideoFPS120 0.2.0 VoutCounterSafe
+ * BiliVideoFPS120 0.2.1 ExactRendererCounter
  *
  * Goals:
- * - Keep the known-safe IJK controller hooks used by 0.1.7/0.1.9.
- * - Avoid the crash-prone render-view / EAGL / Metal Objective-C hooks.
- * - Try to hook IJK's C function SDL_VoutDisplayYUVOverlay. In upstream IJK,
- *   ff_ffplay calls this once for each frame sent to the video output, immediately
- *   before updating stat.vfps. If the symbol is visible in Bilibili's binary,
- *   counting these calls gives us a much more direct output-rate probe.
- * - If the symbol is stripped/hidden, fall back to VID~ (estimate), calculated
- *   from source FPS * playback rate * (1 - IJK dropFrameRate), capped at screen Hz.
- *   The tilde is intentional: the fallback is NOT claimed to be actual presented FPS.
+ * - Keep the known-safe IJK controller hooks.
+ * - Do NOT touch EAGL / Metal / SampleBuffer or broad renderer classes.
+ * - Read the active IJK controller's actual `view`. If that exact runtime class
+ *   implements `display_pixels:` with the expected IJK ABI (void return, one pointer
+ *   argument), hook ONLY that exact class and count frame submissions.
+ * - If the ABI does not match or the method is absent, leave VID as `--` and dump
+ *   the real renderer class / interesting methods into the sandbox log.
  * - Keep max-fps <120 ->120 and CADisplayLink 60->120 / frameInterval 2->1.
  */
 
@@ -35,9 +33,11 @@ static __weak id gActivePlayer = nil;
 static float gPlaybackRate = 1.0f;
 static BOOL gPlayerHooked = NO;
 static BOOL gOptionsHooked = NO;
-static BOOL gVoutHooked = NO;
+static BOOL gRenderHooked = NO;
 static int gInstallAttempt = 0;
-static volatile uint64_t gVoutFrameCount = 0;
+static volatile uint64_t gRenderFrameCount = 0;
+static Class gRenderClass = Nil;
+static Class gLastInspectedRenderClass = Nil;
 
 static NSInteger GTMaxScreenFPS(void) {
     UIScreen *s = [UIScreen mainScreen];
@@ -66,24 +66,91 @@ static void GTLog(NSString *format, ...) {
     });
 }
 
-#pragma mark - IJK output C-function probe
+#pragma mark - Exact active-renderer probe
 
-typedef int (*GTVoutDisplayIMP)(void *vout, void *overlay);
-static GTVoutDisplayIMP origVoutDisplay = NULL;
+typedef void (*GTRenderPixelsIMP)(id, SEL, void *);
+static GTRenderPixelsIMP origRenderPixels = NULL;
 
-static int hookVoutDisplay(void *vout, void *overlay) {
-    __sync_fetch_and_add(&gVoutFrameCount, 1);
-    return origVoutDisplay ? origVoutDisplay(vout, overlay) : 0;
+static void hookRenderPixels(id self, SEL _cmd, void *overlay) {
+    __sync_fetch_and_add(&gRenderFrameCount, 1);
+    if (origRenderPixels) origRenderPixels(self, _cmd, overlay);
 }
 
-static void GTTryInstallVoutHook(void) {
-    if (gVoutHooked) return;
-    void *sym = dlsym(RTLD_DEFAULT, "SDL_VoutDisplayYUVOverlay");
-    if (!sym) return;
-    MSHookFunction(sym, (void *)&hookVoutDisplay, (void **)&origVoutDisplay);
-    if (origVoutDisplay) {
-        gVoutHooked = YES;
-        GTLog(@"HOOK OK SDL_VoutDisplayYUVOverlay sym=%p", sym);
+static NSString *GTMethodEncodingString(Method m) {
+    const char *enc = m ? method_getTypeEncoding(m) : NULL;
+    return enc ? [NSString stringWithUTF8String:enc] : @"(null)";
+}
+
+static void GTLogInterestingRendererMethods(Class cls) {
+    if (!cls || cls == gLastInspectedRenderClass) return;
+    gLastInspectedRenderClass = cls;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    NSMutableArray *interesting = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        SEL sel = method_getName(methods[i]);
+        NSString *name = NSStringFromSelector(sel) ?: @"";
+        NSString *low = name.lowercaseString;
+        if ([low containsString:@"display"] || [low containsString:@"render"] ||
+            [low containsString:@"pixel"] || [low containsString:@"present"] ||
+            [low containsString:@"draw"] || [low containsString:@"frame"]) {
+            [interesting addObject:[NSString stringWithFormat:@"%@{%@}", name, GTMethodEncodingString(methods[i])]];
+        }
+    }
+    if (methods) free(methods);
+    GTLog(@"RENDER methods class=%@ interesting=%@", NSStringFromClass(cls), [interesting componentsJoinedByString:@", "]);
+}
+
+static id GTPlayerView(id player) {
+    if (!player) return nil;
+    SEL s = NSSelectorFromString(@"view");
+    if (![player respondsToSelector:s]) return nil;
+    return ((id(*)(id,SEL))objc_msgSend)(player, s);
+}
+
+static void GTTryInstallExactRendererHook(id player) {
+    if (gRenderHooked || !player) return;
+    id view = GTPlayerView(player);
+    if (!view) return;
+    Class cls = object_getClass(view);
+    if (!cls) return;
+
+    GTLogInterestingRendererMethods(cls);
+
+    SEL sel = NSSelectorFromString(@"display_pixels:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        static Class lastNoMethod = Nil;
+        if (lastNoMethod != cls) {
+            lastNoMethod = cls;
+            NSString *layerClass = @"n/a";
+            if ([view isKindOfClass:[UIView class]]) {
+                UIView *uv = (UIView *)view;
+                CALayer *layer = uv.layer;
+                layerClass = layer ? NSStringFromClass([layer class]) : @"nil";
+            }
+            GTLog(@"RENDER no display_pixels: class=%@ view=%p layer=%@", NSStringFromClass(cls), view, layerClass);
+        }
+        return;
+    }
+
+    unsigned int argc = method_getNumberOfArguments(m);
+    char ret[16] = {0};
+    char arg2[128] = {0};
+    method_getReturnType(m, ret, sizeof(ret));
+    if (argc > 2) method_getArgumentType(m, 2, arg2, sizeof(arg2));
+    NSString *enc = GTMethodEncodingString(m);
+    BOOL safeABI = (argc == 3 && ret[0] == 'v' && arg2[0] == '^');
+
+    GTLog(@"RENDER candidate class=%@ view=%p encoding=%@ argc=%u ret=%s arg2=%s safe=%d",
+          NSStringFromClass(cls), view, enc, argc, ret, arg2, safeABI);
+    if (!safeABI) return;
+
+    MSHookMessageEx(cls, sel, (IMP)hookRenderPixels, (IMP *)&origRenderPixels);
+    if (origRenderPixels) {
+        gRenderClass = cls;
+        gRenderHooked = YES;
+        GTLog(@"HOOK OK exact renderer %@ display_pixels: orig=%p", NSStringFromClass(cls), origRenderPixels);
     }
 }
 
@@ -102,11 +169,13 @@ static void hookPrepare(id self, SEL _cmd) {
     gActivePlayer = self;
     GTLog(@"PLAYER prepare class=%@ obj=%p", NSStringFromClass([self class]), self);
     if (origPrepareToPlay) origPrepareToPlay(self, _cmd);
+    GTTryInstallExactRendererHook(self);
 }
 
 static void hookPlay(id self, SEL _cmd) {
     gActivePlayer = self;
     if (origPlay) origPlay(self, _cmd);
+    GTTryInstallExactRendererHook(self);
 }
 
 static void hookRate(id self, SEL _cmd, float rate) {
@@ -135,7 +204,6 @@ static BOOL GTHookIfPresent(Class cls, SEL sel, IMP replacement, IMP *origOut) {
 
 static void GTInstallRuntimeHooks(void) {
     gInstallAttempt++;
-    GTTryInstallVoutHook();
 
     if (!gOptionsHooked) {
         Class c = NSClassFromString(@"IJKFFOptions");
@@ -162,7 +230,9 @@ static void GTInstallRuntimeHooks(void) {
     }
 
     if (gInstallAttempt >= 120) {
-        GTLog(@"HOOK STATUS attempts=%d player=%d options=%d vout=%d", gInstallAttempt, gPlayerHooked, gOptionsHooked, gVoutHooked);
+        GTLog(@"HOOK STATUS attempts=%d player=%d options=%d renderer=%d renderClass=%@",
+              gInstallAttempt, gPlayerHooked, gOptionsHooked, gRenderHooked,
+              gRenderClass ? NSStringFromClass(gRenderClass) : @"nil");
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -197,25 +267,15 @@ static double GTSourceFPS(id player) {
     return 0.0;
 }
 
-static BOOL GTDropFrameRate(id player, double *outRate) {
-    if (!player || !outRate) return NO;
-    SEL s = NSSelectorFromString(@"dropFrameRate");
-    if (![player respondsToSelector:s]) return NO;
-    float f = ((float(*)(id,SEL))objc_msgSend)(player, s);
-    if (!(f >= 0.0f) || f > 1.0f) return NO;
-    *outRate = (double)f;
-    return YES;
-}
-
 #pragma mark - Overlay
 
 @interface GTVOverlayController : NSObject
 @property(nonatomic, strong) GTVPassthroughWindow *window;
 @property(nonatomic, strong) UILabel *label;
 @property(nonatomic, strong) NSTimer *timer;
-@property(nonatomic, assign) uint64_t lastVoutCount;
-@property(nonatomic, assign) CFTimeInterval lastVoutTime;
-@property(nonatomic, assign) double smoothedVoutFPS;
+@property(nonatomic, assign) uint64_t lastRenderCount;
+@property(nonatomic, assign) CFTimeInterval lastRenderTime;
+@property(nonatomic, assign) double smoothedRenderFPS;
 + (instancetype)shared;
 - (void)start;
 @end
@@ -283,8 +343,10 @@ static BOOL GTDropFrameRate(id player, double *outRate) {
     l.userInteractionEnabled = NO;
     l.adjustsFontSizeToFitWidth = YES;
     l.minimumScaleFactor = 0.72;
-    if ([UIFont respondsToSelector:@selector(monospacedDigitSystemFontOfSize:weight:)]) l.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightSemibold];
-    else l.font = [UIFont boldSystemFontOfSize:10.5];
+    if ([UIFont respondsToSelector:@selector(monospacedDigitSystemFontOfSize:weight:)])
+        l.font = [UIFont monospacedDigitSystemFontOfSize:10.5 weight:UIFontWeightSemibold];
+    else
+        l.font = [UIFont boldSystemFontOfSize:10.5];
     l.text = @"VID --  SRC --  1.0x";
     [root.view addSubview:l];
     self.window = w;
@@ -294,60 +356,53 @@ static BOOL GTDropFrameRate(id player, double *outRate) {
 }
 - (void)tick:(NSTimer *)timer {
     (void)timer;
-    GTTryInstallVoutHook();
+    id player = gActivePlayer;
+    GTTryInstallExactRendererHook(player);
 
     CFTimeInterval now = CACurrentMediaTime();
-    uint64_t count = __sync_fetch_and_add(&gVoutFrameCount, 0);
-    double actualVout = 0.0;
-    if (self.lastVoutTime > 0.0 && now > self.lastVoutTime && count >= self.lastVoutCount) {
-        double dt = now - self.lastVoutTime;
-        uint64_t delta = count - self.lastVoutCount;
+    uint64_t count = __sync_fetch_and_add(&gRenderFrameCount, 0);
+    double actualRender = 0.0;
+    if (self.lastRenderTime > 0.0 && now > self.lastRenderTime && count >= self.lastRenderCount) {
+        double dt = now - self.lastRenderTime;
+        uint64_t delta = count - self.lastRenderCount;
         if (dt > 0.10 && delta > 0) {
             double raw = (double)delta / dt;
-            if (self.smoothedVoutFPS <= 0.0) self.smoothedVoutFPS = raw;
-            else self.smoothedVoutFPS = self.smoothedVoutFPS * 0.45 + raw * 0.55;
-            actualVout = self.smoothedVoutFPS;
+            if (self.smoothedRenderFPS <= 0.0) self.smoothedRenderFPS = raw;
+            else self.smoothedRenderFPS = self.smoothedRenderFPS * 0.45 + raw * 0.55;
+            actualRender = self.smoothedRenderFPS;
         } else if (dt > 0.10 && delta == 0) {
-            self.smoothedVoutFPS = 0.0;
+            self.smoothedRenderFPS = 0.0;
         }
     }
-    self.lastVoutTime = now;
-    self.lastVoutCount = count;
+    self.lastRenderTime = now;
+    self.lastRenderCount = count;
 
-    id player = gActivePlayer;
     double src = GTSourceFPS(player);
-    double drop = 0.0;
-    BOOL haveDrop = GTDropFrameRate(player, &drop);
     double rate = (gPlaybackRate > 0.05f) ? (double)gPlaybackRate : 1.0;
-
     NSString *vidText = @"VID --";
     NSString *mode = @"NONE";
-    if (gVoutHooked && actualVout > 0.05) {
-        vidText = [NSString stringWithFormat:@"VID %.1f", actualVout];
-        mode = @"VOUT";
-    } else if (src > 0.05 && haveDrop) {
-        double est = src * rate * (1.0 - MAX(0.0, MIN(drop, 0.999)));
-        est = MIN(est, (double)GTMaxScreenFPS());
-        vidText = [NSString stringWithFormat:@"VID~%.0f", est];
-        mode = @"EST";
+    if (gRenderHooked && actualRender > 0.05) {
+        vidText = [NSString stringWithFormat:@"VID %.1f", actualRender];
+        mode = @"PIX";
     }
-
     NSString *srcText = src > 0.05 ? [NSString stringWithFormat:@"%.0f", src] : @"--";
     self.label.text = [NSString stringWithFormat:@"%@  SRC %@  %.1fx", vidText, srcText, rate];
     [self layoutOverlay];
 
     static int div = 0;
     if ((++div % 2) == 0) {
-        GTLog(@"FPS mode=%@ voutHook=%d vout=%.3f src=%.3f rate=%.3f dropKnown=%d drop=%.5f count=%llu player=%@",
-              mode, gVoutHooked, actualVout, src, rate, haveDrop, drop, (unsigned long long)count,
-              player ? NSStringFromClass([player class]) : @"nil");
+        id view = GTPlayerView(player);
+        GTLog(@"FPS mode=%@ renderHook=%d render=%.3f src=%.3f rate=%.3f count=%llu player=%@ view=%@",
+              mode, gRenderHooked, actualRender, src, rate, (unsigned long long)count,
+              player ? NSStringFromClass([player class]) : @"nil",
+              view ? NSStringFromClass([view class]) : @"nil");
     }
 }
 - (void)start {
     if (self.timer) return;
     [self buildOverlay];
-    self.lastVoutTime = CACurrentMediaTime();
-    self.lastVoutCount = __sync_fetch_and_add(&gVoutFrameCount, 0);
+    self.lastRenderTime = CACurrentMediaTime();
+    self.lastRenderCount = __sync_fetch_and_add(&gRenderFrameCount, 0);
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick:) userInfo:nil repeats:YES];
     [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
 }
@@ -376,7 +431,7 @@ static BOOL GTDropFrameRate(id player, double *outRate) {
         NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
         [[NSFileManager defaultManager] createDirectoryAtPath:docs withIntermediateDirectories:YES attributes:nil error:nil];
         GTLogPath = [docs stringByAppendingPathComponent:@"BiliVideoFPS120.log"];
-        GTLog(@"BiliVideoFPS120 0.2.0 START maxScreen=%ld home=%@ log=%@", (long)GTMaxScreenFPS(), NSHomeDirectory(), GTLogPath);
+        GTLog(@"BiliVideoFPS120 0.2.1 START maxScreen=%ld home=%@ log=%@", (long)GTMaxScreenFPS(), NSHomeDirectory(), GTLogPath);
         dispatch_async(dispatch_get_main_queue(), ^{
             [[GTVOverlayController shared] start];
             GTInstallRuntimeHooks();
