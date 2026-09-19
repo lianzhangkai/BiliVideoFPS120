@@ -1,8 +1,8 @@
 Package: com.chatgpt.bilivideofps120
 Name: BiliVideoFPS120
-Version: 0.1.9
+Version: 0.2.0
 Architecture: iphoneos-arm
-Description: Safe Bilibili video FPS probe for iOS 13. Reads IJK core video output/decode FPS through ijkmp_get_property_float with view/controller fallbacks; also lifts max-fps to 120 and 60Hz CADisplayLink requests to 120 on ProMotion.
+Description: Bilibili iOS 13 video FPS/120Hz diagnostic build. Counts IJK SDL video-output calls when the symbol is available, falls back to a clearly marked estimate using source FPS, playback rate and drop-frame ratio; also lifts max-fps and 60Hz CADisplayLink requests to 120 on ProMotion.
 Maintainer: ChatGPT
 Author: ChatGPT
 Section: Tweaks
